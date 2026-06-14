@@ -1,1 +1,1 @@
-full content of app.py
+the full correct content of gui/app.py from local file

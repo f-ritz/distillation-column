@@ -1,1 +1,1 @@
-full content of fug.py
+the full correct content of core/fug.py from local file
