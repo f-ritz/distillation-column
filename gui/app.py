@@ -1,1 +1,1 @@
-the complete working CustomTkinter code from the workspace
+paste the full working gui/app.py code here from the workspace

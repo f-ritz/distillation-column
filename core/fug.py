@@ -1,1 +1,1 @@
-the complete working FUG engine from the workspace
+paste the full working core/fug.py code here from the workspace
