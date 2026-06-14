@@ -1,1 +1,1 @@
-full core
+full content of fug.py
