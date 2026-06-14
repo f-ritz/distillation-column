@@ -1,1 +1,1 @@
-updated gui with chemical search
+the complete working code from the last successful local version with chemical search functionality
