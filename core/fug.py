@@ -1,1 +1,1 @@
-the full correct content of core/fug.py from local file
+the complete working FUG engine from the workspace
