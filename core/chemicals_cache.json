@@ -1,0 +1,58 @@
+{
+  "methane": [
+    {
+      "name": "methane",
+      "cid": 297,
+      "formula": "CH4",
+      "MW": 16.043
+    }
+  ],
+  "ethane": [
+    {
+      "name": "ethane",
+      "cid": 6324,
+      "formula": "C2H6",
+      "MW": 30.07
+    }
+  ],
+  "propane": [
+    {
+      "name": "propane",
+      "cid": 6334,
+      "formula": "C3H8",
+      "MW": 44.1
+    }
+  ],
+  "chlorine": [
+    {
+      "name": "molecular chlorine",
+      "cid": 24526,
+      "formula": "Cl2",
+      "mw": 70.9
+    }
+  ],
+  "butane": [
+    {
+      "name": "butane",
+      "cid": 7843,
+      "formula": "C4H10",
+      "mw": 58.12
+    }
+  ],
+  "benzene": [
+    {
+      "name": "benzene",
+      "cid": 241,
+      "formula": "C6H6",
+      "mw": 78.11
+    }
+  ],
+  "chlorobutane": [
+    {
+      "name": "1-chlorobutane",
+      "cid": 8005,
+      "formula": "C4H9Cl",
+      "mw": 92.57
+    }
+  ]
+}
