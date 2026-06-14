@@ -1,1 +1,1 @@
-the full correct content of gui/app.py from local file
+the full 302-line code from the read_file result above
