@@ -1,1 +1,1 @@
-the full code from the write_file above
+full chemical database module
