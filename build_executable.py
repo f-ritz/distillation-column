@@ -24,10 +24,13 @@ def build():
         "--onefile",
         "--windowed",
         "--name", "FUGK_Distillation_Calculator",
-        "--add-data", f"{os.path.join('core', 'fug.py')}{os.pathsep}core",
+        # Bundle the entire core package (fug.py, chemical_database.py, chemicals_cache.json)
+        "--add-data", f"core{os.pathsep}core",
         "--hidden-import", "customtkinter",
         "--hidden-import", "pandas",
         "--hidden-import", "numpy",
+        "--hidden-import", "chemicals",
+        "--hidden-import", "pubchempy",
     ]
     
     # Platform-specific tweaks

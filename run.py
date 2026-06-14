@@ -14,11 +14,10 @@ def main():
     app_path = os.path.join(script_dir, "gui", "app.py")
     
     print("Starting FUGK Distillation Calculator...")
-    print("The application will open in a desktop window.")
-    print("Press Ctrl+C to stop the server.\n")
+    print("The application will open in a desktop window.\n")
     
     try:
-        subprocess.run([sys.executable, "-m", "streamlit", "run", app_path])
+        subprocess.run([sys.executable, app_path])
     except KeyboardInterrupt:
         print("\nShutting down...")
 

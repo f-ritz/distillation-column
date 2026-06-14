@@ -62,6 +62,19 @@ class FUGKDistillation:
             for c in self.components:
                 self.z_feed[c] /= total_z
 
+        # Validate keys exist
+        if self.lk not in self.components:
+            self.lk = self.components[0]
+        if self.hk not in self.components:
+            self.hk = self.components[-1]
+
+        # Ensure alpha_LK > alpha_HK (convention: higher alpha = more volatile)
+        a_lk = self.alpha.get(self.lk, 1.0)
+        a_hk = self.alpha.get(self.hk, 1.0)
+        if a_lk < a_hk:
+            self.warnings.append(f"alpha of LK ({self.lk}) < alpha of HK ({self.hk}). Swapping keys for calculation.")
+            self.lk, self.hk = self.hk, self.lk
+
     def calculate(self,
                   lk_recovery_d: float = 0.99,
                   hk_recovery_b: float = 0.99,
@@ -86,25 +99,15 @@ class FUGKDistillation:
         x_lk_b = b_lk / max(total_b_approx, 1e-6)
         x_hk_b = b_hk / max(total_b_approx, 1e-6)
 
-        # Fenske - Minimum stages
+        # Fenske - Minimum stages (keys only)
         alpha_lk_hk = self.alpha[self.lk] / self.alpha[self.hk]
+        if alpha_lk_hk <= 1.0:
+            self.warnings.append("Relative volatility of LK/HK <= 1 — separation impossible or keys reversed.")
+            alpha_lk_hk = 1.05
         N_min = np.log((x_lk_d / max(x_lk_b, 1e-8)) * (x_hk_b / max(x_hk_d, 1e-8))) / np.log(alpha_lk_hk)
         N_min = max(N_min, 1.0)
 
-        # Underwood-style minimum reflux (simplified but practical)
-        R_min = self._estimate_rmin(lk_recovery_d, hk_recovery_b)
-
-        # Operating conditions
-        R_actual = R_min * R_over_Rmin
-
-        # Gilliland correlation
-        N_actual = self._gilliland(R_actual, R_min, N_min)
-        N_actual = min(N_actual, max_stages)
-
-        # Kirkbride feed stage
-        feed_stage = self._kirkbride(N_actual, x_lk_d, x_lk_b, x_hk_d, x_hk_b)
-
-        # Component distributions
+        # Component distributions using Fenske for non-keys (used for both final results and Underwood approx)
         component_recoveries = {}
         component_splits = {}
 
@@ -114,15 +117,41 @@ class FUGKDistillation:
             elif comp == self.hk:
                 rec_d = 1 - hk_recovery_b
             else:
-                # Fenske-style distribution for non-keys
+                # Fenske-style distribution for non-keys at total reflux N_min
                 alpha_comp = self.alpha[comp] / self.alpha[self.hk]
                 rec_d = (alpha_comp ** N_min) / (1 + (alpha_comp ** N_min))
-                rec_d = np.clip(rec_d, 0.001, 0.999)
+                rec_d = float(np.clip(rec_d, 0.001, 0.999))
 
             component_recoveries[comp] = rec_d
             d_flow = rec_d * self.z_feed[comp] * self.feed_flow
             b_flow = (1 - rec_d) * self.z_feed[comp] * self.feed_flow
             component_splits[comp] = (d_flow, b_flow)
+
+        # Approximate distillate mole fractions from the Fenske splits (needed for Underwood)
+        total_d_approx = sum(s[0] for s in component_splits.values())
+        xd_approx = {c: component_splits[c][0] / max(total_d_approx, 1e-6) for c in self.components}
+
+        # Proper multicomponent Underwood minimum reflux
+        R_min = self._underwood_rmin(xd_approx)
+
+        # Operating conditions
+        R_actual = R_min * R_over_Rmin
+
+        # Gilliland correlation
+        N_actual = self._gilliland(R_actual, R_min, N_min)
+        N_actual = min(N_actual, max_stages)
+
+        # Kirkbride feed stage (recompute key x using final splits for accuracy)
+        d_lk_final, b_lk_final = component_splits[self.lk]
+        d_hk_final, b_hk_final = component_splits[self.hk]
+        total_d_final = sum(s[0] for s in component_splits.values())
+        total_b_final = sum(s[1] for s in component_splits.values())
+        x_lk_d = d_lk_final / max(total_d_final, 1e-6)
+        x_hk_d = d_hk_final / max(total_d_final, 1e-6)
+        x_lk_b = b_lk_final / max(total_b_final, 1e-6)
+        x_hk_b = b_hk_final / max(total_b_final, 1e-6)
+
+        feed_stage = self._kirkbride(N_actual, x_lk_d, x_lk_b, x_hk_d, x_hk_b)
 
         # Build results
         total_d = sum(s[0] for s in component_splits.values())
@@ -142,19 +171,88 @@ class FUGKDistillation:
         )
         return results
 
-    def _estimate_rmin(self, lk_rec_d: float, hk_rec_b: float) -> float:
+    def _underwood_rmin(self, xd: Dict[str, float]) -> float:
+        """
+        Proper Underwood minimum reflux for (pseudo) binary or multicomponent constant-alpha.
+        1. Numerically solve for theta from the feed Underwood equation:
+              sum( alpha_i * z_i / (alpha_i - theta) ) = 1 - q
+           theta lies between alpha_hk and alpha_lk (assuming alpha_lk > alpha_hk > 0).
+        2. Then:
+              R_min = sum( alpha_i * xD_i / (alpha_i - theta) ) - 1
+        """
         alpha_lk = self.alpha[self.lk]
-        z_lk = self.z_feed[self.lk]
+        alpha_hk = self.alpha[self.hk]
+        if alpha_lk <= alpha_hk:
+            alpha_lk = alpha_hk + 0.2
 
-        r_min = ((alpha_lk / (alpha_lk - 1)) * (lk_rec_d * z_lk) / z_lk) - 1
-        r_min = max(r_min, 0.5)
+        # Feasible bracket for the relevant root
+        lo = min(alpha_hk, alpha_lk) + 1e-6
+        hi = max(alpha_hk, alpha_lk) - 1e-6
+        if lo >= hi:
+            lo, hi = 0.5, alpha_lk + 1.0   # very wide fallback
 
-        if self.q > 1.0:
-            r_min *= 0.95
-        elif self.q < 0:
-            r_min *= 1.1
+        # Try to tighten bracket around a sign change
+        def f(theta):
+            s = 0.0
+            for c in self.components:
+                a = self.alpha.get(c, 1.0)
+                z = self.z_feed.get(c, 0.0)
+                den = a - theta
+                if abs(den) < 1e-9:
+                    den = 1e-9 if den >= 0 else -1e-9
+                s += (a * z) / den
+            return s - (1.0 - self.q)
 
-        return r_min
+        # Bisection search
+        f_lo = f(lo)
+        f_hi = f(hi)
+        # If same sign, expand the interval
+        for _ in range(8):
+            if f_lo * f_hi <= 0:
+                break
+            lo = max(1e-4, lo * 0.6)
+            hi = hi * 1.4
+            f_lo = f(lo)
+            f_hi = f(hi)
+
+        theta = None
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            fm = f(mid)
+            if abs(fm) < 1e-8:
+                theta = mid
+                break
+            if f_lo * fm <= 0:
+                hi = mid
+                f_hi = fm
+            else:
+                lo = mid
+                f_lo = fm
+        if theta is None:
+            theta = (lo + hi) / 2.0
+            self.warnings.append("Underwood theta root did not fully converge — using approximate value.")
+
+        # Now compute Rmin from distillate composition
+        rmin_sum = 0.0
+        for c in self.components:
+            a = self.alpha.get(c, 1.0)
+            xdi = xd.get(c, 0.0)
+            den = a - theta
+            if abs(den) < 1e-9:
+                den = 1e-9 if den >= 0 else -1e-9
+            rmin_sum += (a * xdi) / den
+
+        R_min = rmin_sum - 1.0
+
+        # Apply simple q correction / bounds (empirical guard)
+        if self.q > 1.0:   # subcooled feed tends to lower Rmin slightly
+            R_min *= 0.92
+        elif self.q < 0.0:  # superheated vapor feed
+            R_min *= 1.08
+
+        # Practical floor for most real columns (prevents nonsensical 0.01 values on very easy splits)
+        R_min = max(R_min, 0.15)
+        return R_min
 
     def _gilliland(self, R: float, R_min: float, N_min: float) -> float:
         if R <= R_min:
