@@ -1,0 +1,82 @@
+name: Build executables (Windows + macOS)
+
+on:
+  push:
+    tags:
+      - 'v*'          # Push a tag like v1.0.0 or v0.9-beta to trigger a release build
+  workflow_dispatch:  # Allow manual run from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: Distillation_Calculator.exe
+            asset_name: Distillation_Calculator-Windows.exe
+          - os: macos-latest
+            artifact_name: Distillation_Calculator.app
+            asset_name: Distillation_Calculator-macOS.zip   # we zip the .app for a clean single-file download
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with the project script
+        run: python build_executable.py
+
+      - name: Prepare macOS artifact (zip the .app bundle)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          # The build script creates Distillation_Calculator.app when on macOS
+          if [ -d "Distillation_Calculator.app" ]; then
+            zip -r -y "../${{ matrix.asset_name }}" "Distillation_Calculator.app"
+          else
+            # Fallback: just zip whatever is there (the raw executable)
+            zip -r "../${{ matrix.asset_name }}" .
+          fi
+        shell: bash
+
+      - name: Upload build artifact (for manual download / debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-build
+          path: |
+            dist/
+            ${{ matrix.asset_name }}
+          retention-days: 14
+
+      - name: Attach to GitHub Release (when a version tag was pushed)
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          # On Windows job: attach the .exe
+          # On macOS job: attach the zipped .app
+          files: |
+            ${{ matrix.os == 'windows-latest' && 'dist/Distillation_Calculator.exe' || '' }}
+            ${{ matrix.os == 'macos-latest' && matrix.asset_name || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# Notes for the repo owner:
+# 1. Tag a release from your machine (even Windows):   git tag v1.2.0 && git push origin v1.2.0
+#    GitHub Actions will automatically build BOTH Windows and macOS versions and attach them.
+# 2. You can also go to the Actions tab → "Build executables" → "Run workflow" for ad-hoc builds.
+# 3. After the first tag, the Release will appear with the two platform assets.
+# 4. For macOS users: after downloading the zip, unzip, then right-click the .app → Open (or run `xattr -cr` in Terminal the first time). Drag the .app into /Applications.

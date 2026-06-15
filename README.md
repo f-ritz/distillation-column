@@ -38,12 +38,14 @@ The app uses **only the Ideal (Raoult's law)** model: K-values are computed from
 ### For most people: just download a release and run it
 
 1. Go to the **Releases** page of this repository on GitHub (look for the "Releases" tab or https://github.com/f-ritz/distillation-column/releases).
-2. Download the latest asset:
-   - Windows: `Distillation_Calculator.exe` (single-file executable, ~80+ MB)
-   - macOS: the corresponding app or zip for your architecture
-3. On Windows the first time you run it you may see a Windows Defender SmartScreen warning — click "More info" → "Run anyway".
-4. Double-click the executable. The app opens directly (no installer, no Python needed).
-5. Use the GUI (detailed steps below). When done, just close the window.
+2. Download the latest asset for your platform:
+   - **Windows**: `Distillation_Calculator-Windows.exe` (or `Distillation_Calculator.exe`)
+   - **macOS**: `Distillation_Calculator-macOS.zip` (contains a proper `Distillation_Calculator.app` bundle)
+3. Windows: If SmartScreen warns, click "More info" → "Run anyway".
+4. macOS: Unzip. First launch: right-click `Distillation_Calculator.app` → **Open** (or in Terminal: `xattr -cr Distillation_Calculator.app`). Optionally drag the app to `/Applications`.
+5. Double-click / open the app. No Python install or other dependencies required.
+
+**How macOS builds appear**: Even if the maintainer only has Windows, the GitHub Actions workflow (triggered by version tags) builds the real macOS `.app` on Apple's infrastructure and attaches it to every release automatically.
 
 **Important — this is a first-pass approximation calculator only.**  
 The results are useful for education, quick feasibility checks, and preliminary design work.  
@@ -125,20 +127,47 @@ python -m pytest tests/ -q
 
 ## Building standalone executables (Windows + macOS)
 
-Use the helper script (recommended):
+### The easy way to get both platforms (recommended)
+Just push a version tag from anywhere (even your Windows machine):
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+A GitHub Actions workflow (see `.github/workflows/build.yml`) will automatically:
+- Build the Windows `.exe` on a Windows runner
+- Build a proper `Distillation_Calculator.app` bundle on a macOS runner (with icon if `icon.icns` is present)
+- Zip the macOS app for easy distribution
+- Attach both artifacts to the GitHub Release for that tag
+
+You (and your users) then just download the correct asset from the Releases page. No Mac required on your end.
+
+You can also trigger a build manually from the "Actions" tab → "Build executables (Windows + macOS)" → "Run workflow".
+
+### Local build (when you are on the target machine)
+On the machine you want to target:
 
 ```bash
 pip install pyinstaller
 python build_executable.py
 ```
 
-This produces `dist/Distillation_Calculator.exe` (or macOS equivalent). It bundles:
-- icon.png (runtime window + taskbar/dock icon on all platforms)
-- icon.ico when present (for the Windows .exe file icon via --icon and for iconbitmap inside the app)
+- **Windows**: produces `dist/Distillation_Calculator.exe`
+- **macOS**: produces `dist/Distillation_Calculator.app` (a real macOS application bundle)
 
-See `build_executable.py` for the exact PyInstaller flags and icon handling. Linux builds are not supported in the script (per earlier preference).
+The script always bundles `icon.png` (for the running window + dock/taskbar via the app's icon code).  
+Provide `icon.ico` (Windows) or `icon.icns` (macOS) in the project root for the best Finder/Explorer icon on the distributed file itself.
 
-After a build you may still need the usual SmartScreen / "damaged app" steps on first run of the new binary.
+See the top of `build_executable.py` for exact icon conversion commands for `.icns`.
+
+After building on macOS you will still usually need the first-launch steps:
+- Right-click the `.app` → Open, or
+- `xattr -cr dist/Distillation_Calculator.app` in Terminal
+
+Then you can copy the `.app` into `/Applications`.
+
+Linux builds remain unsupported.
 
 ## Limitations & Notes
 
