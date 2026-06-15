@@ -62,46 +62,98 @@ _cache = _load_cache()
 def search_chemicals(query: str, limit: int = 15) -> List[Dict]:
     """
     Search chemicals using PubChem.
-    Results are cached locally for future use (offline).
+    - Primary search: by name (supports partial/substring matches via PubChem + local cache augmentation).
+    - If the query looks like a CAS number (contains '-' or is numeric), we also search the 'cas' namespace.
+    - Results include IUPAC name (preferred), formula, MW, and CAS when available.
+    - The dropdown in the GUI shows rich info (name + formula + CAS) so you know exactly what is being added.
+    - Local cache ensures previously discovered chemicals appear in substring searches even offline.
     """
-    query = query.strip().lower()
+    query = query.strip()
     if not query:
         return []
 
-    # Check local cache first
-    if query in _cache:
-        return _cache[query][:limit]
+    q_lower = query.lower()
 
-    try:
-        compounds = pcp.get_compounds(query, "name")
+    # Get direct results for this query (cache or PubChem)
+    direct_results = []
+    if q_lower in _cache:
+        direct_results = _cache[q_lower]
+    else:
+        try:
+            compounds = []
+            # Always try name search (good for partial names, IUPAC, common names, synonyms)
+            compounds.extend(pcp.get_compounds(query, "name"))
 
-        results = []
-        for comp in compounds[:limit]:
-            name = comp.iupac_name or (comp.synonyms[0] if comp.synonyms else query.title())
-            cas = None
-            try:
-                if getattr(comp, 'cas', None):
-                    cas = comp.cas[0] if isinstance(comp.cas, (list, tuple)) and comp.cas else comp.cas
-            except Exception:
-                pass
-            results.append({
-                "name": name,
-                "cid": comp.cid,
-                "formula": comp.molecular_formula,
-                "mw": comp.molecular_weight,
-                "cas": cas
-            })
+            # If it looks like a CAS (dashes or mostly digits), also search CAS namespace explicitly
+            looks_like_cas = '-' in query or (query.replace('-', '').isdigit() and len(query.replace('-', '')) >= 5)
+            if looks_like_cas:
+                try:
+                    compounds.extend(pcp.get_compounds(query, "cas"))
+                except Exception:
+                    pass
 
-        # Cache the result
-        if results:
-            _cache[query] = results
-            _save_cache(_cache)
+            # Dedup by CID
+            seen_cids = set()
+            unique_compounds = []
+            for comp in compounds:
+                if comp.cid not in seen_cids:
+                    seen_cids.add(comp.cid)
+                    unique_compounds.append(comp)
 
-        return results
+            direct_results = []
+            for comp in unique_compounds[:limit]:
+                name = comp.iupac_name or (comp.synonyms[0] if comp.synonyms else query.title())
+                cas = None
+                try:
+                    if getattr(comp, 'cas', None):
+                        cas = comp.cas[0] if isinstance(comp.cas, (list, tuple)) and comp.cas else comp.cas
+                except Exception:
+                    pass
+                direct_results.append({
+                    "name": name,
+                    "cid": comp.cid,
+                    "formula": comp.molecular_formula,
+                    "mw": comp.molecular_weight,
+                    "cas": cas
+                })
 
-    except Exception as e:
-        print(f"PubChem search error for '{query}': {e}")
-        return []
+            if direct_results:
+                _cache[q_lower] = direct_results
+                _save_cache(_cache)
+
+        except Exception as e:
+            print(f"PubChem search error for '{query}': {e}")
+            direct_results = []
+
+    # Augment with previously cached chemicals that contain the query string (substring support)
+    augmented = list(direct_results)
+    seen = set()
+    for r in direct_results:
+        key = r.get("cid") or r.get("name", "").lower()
+        seen.add(key)
+
+    for cached_list in _cache.values():
+        for r in cached_list:
+            name_lower = r.get("name", "").lower()
+            if q_lower in name_lower:
+                key = r.get("cid") or name_lower
+                if key not in seen:
+                    seen.add(key)
+                    augmented.append(r)
+
+    # Sort: prefix matches first, then other contains
+    def sort_key(r):
+        name_lower = r.get("name", "").lower()
+        if name_lower.startswith(q_lower):
+            return (0, name_lower)
+        elif q_lower in name_lower:
+            return (1, name_lower)
+        else:
+            return (2, name_lower)
+
+    augmented.sort(key=sort_key)
+
+    return augmented[:limit]
 
 
 # --- Vapor pressure / relative volatility estimation ---
@@ -211,55 +263,21 @@ def calculate_relative_volatility(comp1: str, comp2: str, T: float) -> Optional[
 def compute_k_values(
     component_names: List[str],
     T: float,
-    P_bar: float,
-    method: str = "Ideal",
-    props: Optional[Dict[str, Dict]] = None,
-    composition: Optional[Dict[str, float]] = None,
-    nrtl_params: Optional[Dict[tuple, tuple]] = None
+    P_bar: float
 ) -> Dict[str, float]:
     """
-    Compute K-values (y/x) at T (K) and P (bar) using the selected thermodynamic method.
-
-    composition: liquid mole fractions (required for NRTL gamma)
-    nrtl_params: {(name_i, name_j): (tau_ij, tau_ji, alpha)}
+    Compute K-values (y/x) at T (K) and P (bar) using ideal (Raoult's law) model:
+    K_i = P^sat_i(T) / P   (from corresponding-states vapor pressure estimation).
     """
     if P_bar <= 0:
         P_bar = 1.0
 
-    kvals: Dict[str, float] = {}
-    method_l = method.lower()
     P_pa = P_bar * 100_000.0
+    kvals: Dict[str, float] = {}
 
     for name in component_names:
-        p = props.get(name, {}) if props else {}
-
-        if "ideal" in method_l:
-            psat = estimate_psat(name, T)
-            kvals[name] = (psat / P_pa) if psat and psat > 0 else 1.0
-
-        elif "nrtl" in method_l:
-            psat = estimate_psat(name, T) or 1e-10
-            x = composition or {nm: 1.0 / len(component_names) for nm in component_names}
-            gammas = compute_nrtl_gamma(component_names, x, nrtl_params or {}, T)
-            gamma = gammas.get(name, 1.0)
-            kvals[name] = gamma * psat / P_pa
-
-        else:
-            # Wilson / PR / SRK approx using critical props
-            tc = p.get("tc")
-            pc_bar = p.get("pc_bar") or p.get("pc")
-            omega = p.get("omega")
-
-            if tc and pc_bar and omega is not None and T > 0:
-                Tr = T / tc
-                if Tr > 0.1:
-                    k = (pc_bar / P_bar) * np.exp(5.37 * (1 + omega) * (1 - Tr))
-                    kvals[name] = max(1e-6, min(k, 1e6))
-                else:
-                    kvals[name] = 1.0
-            else:
-                psat = estimate_psat(name, T)
-                kvals[name] = (psat / P_pa) if psat and psat > 0 else 1.0
+        psat = estimate_psat(name, T)
+        kvals[name] = (psat / P_pa) if psat and psat > 0 else 1.0
 
     return kvals
 
@@ -318,14 +336,11 @@ def compute_feed_quality(
     component_names: List[str],
     z_dict: Dict[str, float],
     T_feed: float,
-    P_bar: float,
-    method: str = "Ideal",
-    props: Optional[Dict[str, Dict]] = None,
-    nrtl_params: Optional[Dict[tuple, tuple]] = None
+    P_bar: float
 ) -> Tuple[float, str, Dict[str, float]]:
     """
     Calculate the feed thermal condition parameter q from actual feed temperature and pressure
-    using the selected thermodynamic method for K-values.
+    using ideal (Raoult's law) K-values.
     """
     if T_feed <= 10 or P_bar <= 0:
         return 1.0, "Invalid feed T or P", {"phi": 0.0}
@@ -336,7 +351,7 @@ def compute_feed_quality(
     if z_tot > 1e-12:
         z_list = [z / z_tot for z in z_list]
 
-    K_dict = compute_k_values(names, T_feed, P_bar, method=method, props=props, composition=z_dict, nrtl_params=nrtl_params)
+    K_dict = compute_k_values(names, T_feed, P_bar)
     K_list = [K_dict.get(n, 1.0) for n in names]
 
     phi = _rachford_rice(z_list, K_list)
@@ -357,7 +372,6 @@ def compute_feed_quality(
         "T_feed_K": T_feed,
         "P_bar": P_bar,
         "state": state,
-        "method": method,
     }
 
     return round(q, 4), state, info
@@ -367,13 +381,13 @@ def compute_feed_quality(
 # Simple thermodynamic property estimators for shortcut column
 # =============================================================================
 
-def estimate_bubble_point(component_names, z_mole, P_bar, T_guess=350.0, method="Ideal", props=None, nrtl_params=None, tol=0.1, max_iter=60):
-    """Estimate bubble point temperature (K) using the selected thermodynamic method for K-values."""
+def estimate_bubble_point(component_names, z_mole, P_bar, T_guess=350.0, tol=0.1, max_iter=60):
+    """Estimate bubble point temperature (K) using ideal (Raoult's law) K-values."""
     if P_bar <= 0:
         P_bar = 1.0
 
     def objective(T):
-        K_dict = compute_k_values(component_names, T, P_bar, method=method, props=props, composition=z_mole, nrtl_params=nrtl_params)
+        K_dict = compute_k_values(component_names, T, P_bar)
         s = 0.0
         for name, z in zip(component_names, z_mole):
             s += K_dict.get(name, 1.0) * z
@@ -395,13 +409,13 @@ def estimate_bubble_point(component_names, z_mole, P_bar, T_guess=350.0, method=
     return round(T, 1)
 
 
-def estimate_dew_point(component_names, z_mole, P_bar, T_guess=350.0, method="Ideal", props=None, nrtl_params=None, tol=0.1, max_iter=60):
-    """Estimate dew point temperature (K) using the selected thermodynamic method for K-values."""
+def estimate_dew_point(component_names, z_mole, P_bar, T_guess=350.0, tol=0.1, max_iter=60):
+    """Estimate dew point temperature (K) using ideal (Raoult's law) K-values."""
     if P_bar <= 0:
         P_bar = 1.0
 
     def objective(T):
-        K_dict = compute_k_values(component_names, T, P_bar, method=method, props=props, composition=z_mole, nrtl_params=nrtl_params)
+        K_dict = compute_k_values(component_names, T, P_bar)
         s = 0.0
         for name, z in zip(component_names, z_mole):
             ki = K_dict.get(name, 1.0)
@@ -465,59 +479,3 @@ def get_rich_thermo_properties(name: str) -> Dict[str, float]:
     return props
 
 
-def compute_nrtl_gamma(
-    component_names: List[str],
-    x_dict: Dict[str, float],
-    nrtl_params: Dict[tuple, tuple],
-    T: float = 298.15
-) -> Dict[str, float]:
-    """
-    Compute activity coefficients using the NRTL model (multi-component).
-    nrtl_params: {(name_i, name_j): (tau_ij, tau_ji, alpha_ij)}
-    tau values are assumed to be the effective values ( (gij-gjj)/RT ) at the temperature of interest.
-    """
-    n = len(component_names)
-    if n == 0:
-        return {}
-
-    x = np.array([x_dict.get(nm, 0.0) for nm in component_names])
-    x_sum = x.sum()
-    if x_sum > 1e-12:
-        x = x / x_sum
-
-    name_to_idx = {nm: idx for idx, nm in enumerate(component_names)}
-
-    tau = np.zeros((n, n))
-    alpha = np.full((n, n), 0.3)  # default alpha
-
-    for (ni, nj), (tau_ij, tau_ji, aij) in nrtl_params.items():
-        if ni in name_to_idx and nj in name_to_idx:
-            i = name_to_idx[ni]
-            j = name_to_idx[nj]
-            tau[i, j] = tau_ij
-            tau[j, i] = tau_ji
-            alpha[i, j] = aij
-            alpha[j, i] = aij
-
-    G = np.exp(-alpha * tau)
-
-    ln_gamma = np.zeros(n)
-    for i in range(n):
-        # term 1
-        denom_i = sum(x[k] * G[k, i] for k in range(n))
-        term1 = 0.0
-        if denom_i > 0:
-            term1 = sum(x[j] * tau[j, i] * G[j, i] / denom_i for j in range(n))
-
-        # term 2
-        term2 = 0.0
-        for j in range(n):
-            denom_j = sum(x[k] * G[k, j] for k in range(n))
-            if denom_j > 0:
-                s = sum(x[m] * tau[m, j] * G[m, j] / denom_j for m in range(n))
-                term2 += x[j] * G[i, j] / denom_j * (tau[i, j] - s)
-
-        ln_gamma[i] = term1 + term2
-
-    gamma = np.exp(ln_gamma)
-    return {nm: float(g) for nm, g in zip(component_names, gamma)}

@@ -23,7 +23,8 @@ class DistillationResults:
     R_min: float
     N_actual: float
     R_actual: float
-    feed_stage: int
+    feed_stage_min: int   # feed location if operating at total reflux (N_min)
+    feed_stage_actual: int  # feed location at the actual (operating) number of stages
     distillate_composition: Dict[str, float]
     bottoms_composition: Dict[str, float]
     component_recoveries: Dict[str, float]
@@ -107,6 +108,9 @@ class FUGKDistillation:
         N_min = np.log((x_lk_d / max(x_lk_b, 1e-8)) * (x_hk_b / max(x_hk_d, 1e-8))) / np.log(alpha_lk_hk)
         N_min = max(N_min, 1.0)
 
+        # Kirkbride feed stage at minimum stages (total reflux case)
+        feed_stage_min = self._kirkbride(N_min, x_lk_d, x_lk_b, x_hk_d, x_hk_b)
+
         # Component distributions using Fenske for non-keys (used for both final results and Underwood approx)
         component_recoveries = {}
         component_splits = {}
@@ -141,7 +145,7 @@ class FUGKDistillation:
         N_actual = self._gilliland(R_actual, R_min, N_min)
         N_actual = min(N_actual, max_stages)
 
-        # Kirkbride feed stage (recompute key x using final splits for accuracy)
+        # Recompute key x using final splits for accuracy
         d_lk_final, b_lk_final = component_splits[self.lk]
         d_hk_final, b_hk_final = component_splits[self.hk]
         total_d_final = sum(s[0] for s in component_splits.values())
@@ -151,7 +155,8 @@ class FUGKDistillation:
         x_lk_b = b_lk_final / max(total_b_final, 1e-6)
         x_hk_b = b_hk_final / max(total_b_final, 1e-6)
 
-        feed_stage = self._kirkbride(N_actual, x_lk_d, x_lk_b, x_hk_d, x_hk_b)
+        # Kirkbride feed stage at actual operating stages
+        feed_stage_actual = self._kirkbride(N_actual, x_lk_d, x_lk_b, x_hk_d, x_hk_b)
 
         # Build results
         total_d = sum(s[0] for s in component_splits.values())
@@ -162,7 +167,8 @@ class FUGKDistillation:
             R_min=round(R_min, 3),
             N_actual=round(N_actual, 1),
             R_actual=round(R_actual, 3),
-            feed_stage=feed_stage,
+            feed_stage_min=feed_stage_min,
+            feed_stage_actual=feed_stage_actual,
             distillate_composition={c: round(component_splits[c][0] / max(total_d, 1e-6), 4) for c in self.components},
             bottoms_composition={c: round(component_splits[c][1] / max(total_b, 1e-6), 4) for c in self.components},
             component_recoveries=component_recoveries,
@@ -294,4 +300,5 @@ if __name__ == "__main__":
     print(f"N_min = {results.N_min}")
     print(f"R_min = {results.R_min}")
     print(f"N_actual = {results.N_actual}")
-    print(f"Feed stage = {results.feed_stage}")
+    print(f"Feed stage (min) = {results.feed_stage_min}")
+    print(f"Feed stage (actual) = {results.feed_stage_actual}")

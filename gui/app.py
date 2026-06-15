@@ -1,9 +1,12 @@
 """
-FUGK Distillation Calculator
+Fenske-Underwood-Gilliland-Kirkbride (FUGK) Distillation Calculator
 - Chemical search via PubChem + local cache
 - Automatic relative volatility (Psat via corresponding states)
 - Editable z and α + selectable Light/Heavy keys
-- Proper multicomponent FUGK (Underwood min reflux)
+- Proper multicomponent Fenske-Underwood-Gilliland-Kirkbride (Underwood min reflux)
+- Feed T/P driven q calculation with molar/mass basis support
+- Reboiler/condenser duties with proper sign convention
+- Preliminary column sizing (height/diameter)
 """
 
 import customtkinter as ctk
@@ -22,7 +25,6 @@ from core.chemical_database import (
     estimate_bubble_point,
     estimate_dew_point,
     estimate_average_latent_heat,
-    get_rich_thermo_properties,
 )
 
 ctk.set_appearance_mode("System")
@@ -32,17 +34,78 @@ ctk.set_default_color_theme("blue")
 class FUGKApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("FUGK Distillation Calculator")
+        self.title("Distillation calculator")
         self.geometry("1250x900")
         self.minsize(1150, 750)
+
+        # Cross-platform icon support (icon.png for runtime title bar + dock/taskbar)
+        # Place icon.png in the project root.
+        # For best Windows results (taskbar + .exe file icon), also provide icon.ico
+        # and the build script will use it.
+        try:
+            import os
+            import sys
+            import tkinter as tk
+
+            # Works in source and in PyInstaller bundles (onefile uses _MEIPASS)
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                base_dir = sys._MEIPASS
+            else:
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+            # Prefer .ico on Windows for best taskbar compatibility
+            icon_path = None
+            if sys.platform.startswith("win"):
+                ico_path = os.path.join(base_dir, "icon.ico")
+                if os.path.exists(ico_path):
+                    icon_path = ico_path
+                else:
+                    png_path = os.path.join(base_dir, "icon.png")
+                    if os.path.exists(png_path):
+                        icon_path = png_path
+            else:
+                png_path = os.path.join(base_dir, "icon.png")
+                if os.path.exists(png_path):
+                    icon_path = png_path
+
+            # Dev fallback
+            if not icon_path or not os.path.exists(icon_path):
+                cwd_icon = os.path.join(os.getcwd(), "icon.png")
+                if os.path.exists(cwd_icon):
+                    icon_path = cwd_icon
+
+            if icon_path and os.path.exists(icon_path):
+                if icon_path.lower().endswith(".ico"):
+                    # On Windows, iconbitmap with .ico is the most reliable for both title bar and taskbar
+                    # when the .exe was built with --icon
+                    self.iconbitmap(icon_path)
+                else:
+                    # PNG for cross-platform title bar (and dock/taskbar on mac/linux)
+                    icon = tk.PhotoImage(file=icon_path)
+                    self._icon_image = icon  # keep reference - very important!
+                    self.after(0, lambda: self.iconphoto(True, self._icon_image))
+            else:
+                print(f"[Icon] No icon file found (checked {base_dir} for .ico or .png)")
+
+            # Helps Windows show the custom taskbar icon reliably
+            if sys.platform.startswith("win"):
+                try:
+                    import ctypes
+                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                        "distillation.calculator"
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[Icon] Failed to set icon: {e}")
 
         self.chemicals = []   # list of {"name": str, "z": float, "alpha": float, "mw": float}
         self.lk_name: str = ""
         self.hk_name: str = ""
         self.last_results = None  # store for export
         self.last_search_results = []  # full search dicts for mw etc.
-        self.nrtl_params = {}
-        self.nrtl_entry_widgets = {}
+
         self.create_widgets()
         # Initial state for sum label
         if hasattr(self, "z_sum_label"):
@@ -53,7 +116,7 @@ class FUGKApp(ctk.CTk):
         title_frame = ctk.CTkFrame(self)
         title_frame.pack(fill="x", padx=10, pady=8)
 
-        ctk.CTkLabel(title_frame, text="🧪 FUGK Shortcut Distillation Calculator  (Aspen DSTWU-style)",
+        ctk.CTkLabel(title_frame, text="🧪 Distillation Calculator",
                      font=ctk.CTkFont(size=18, weight="bold")).pack(pady=5)
 
         main = ctk.CTkScrollableFrame(self)
@@ -66,12 +129,12 @@ class FUGKApp(ctk.CTk):
         right.pack(side="right", fill="both", expand=True, padx=(5, 0))
 
         # === CHEMICAL SEARCH ===
-        ctk.CTkLabel(left, text="1. Add Chemicals", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=8, anchor="w", padx=10)
+        ctk.CTkLabel(left, text="1. Add Chemicals (search PubChem by name or CAS; results show preferred name + formula + CAS)", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=8, anchor="w", padx=10)
 
         search_frame = ctk.CTkFrame(left)
         search_frame.pack(fill="x", padx=10, pady=3)
 
-        self.search_entry = ctk.CTkEntry(search_frame, width=200, placeholder_text="Search chemical...")
+        self.search_entry = ctk.CTkEntry(search_frame, width=200, placeholder_text="Search by name or CAS...")
         self.search_entry.pack(side="left", padx=5)
 
         ctk.CTkButton(search_frame, text="Search", command=self.search_chemical, width=70).pack(side="left")
@@ -146,7 +209,7 @@ class FUGKApp(ctk.CTk):
         self.comp_basis.grid(row=1, column=1, columnspan=2, padx=3, sticky="w")
         ctk.CTkLabel(feed_frame, text="(table updates on change)", font=ctk.CTkFont(size=9), text_color="gray").grid(row=1, column=3, sticky="w")
 
-        # Temperature and Pressure - critical for q + thermo
+        # Temperature and Pressure - critical for q calculation
         ctk.CTkLabel(feed_frame, text="Feed Temperature (K):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         self.feed_temp = ctk.CTkEntry(feed_frame, width=85)
         self.feed_temp.insert(0, "355")
@@ -158,18 +221,6 @@ class FUGKApp(ctk.CTk):
         self.pressure.insert(0, "1.0")
         self.pressure.grid(row=3, column=1, padx=3)
         ctk.CTkLabel(feed_frame, text="← used for K-values, q, and sizing", font=ctk.CTkFont(size=9), text_color="gray").grid(row=3, column=2, columnspan=2, sticky="w")
-
-        # Thermodynamic model selector (user request)
-        ctk.CTkLabel(feed_frame, text="Thermodynamic Model:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
-        self.thermo_method = ctk.CTkComboBox(
-            feed_frame,
-            values=["Ideal (Raoult's law)", "Wilson (simple EOS)", "Peng-Robinson approx", "Soave-Redlich-Kwong approx", "NRTL"],
-            width=180,
-            command=self.on_thermo_method_changed
-        )
-        self.thermo_method.set("Ideal (Raoult's law)")
-        self.thermo_method.grid(row=4, column=1, columnspan=2, padx=3, sticky="w")
-        ctk.CTkLabel(feed_frame, text="← affects q, T_top/T_bot, K-values", font=ctk.CTkFont(size=9), text_color="gray").grid(row=4, column=3, sticky="w")
 
         # === 3. KEYS + SEPARATION TARGETS (Step C) ===
         ctk.CTkLabel(left, text="3. Keys & Separation Targets (recoveries define the split)",
@@ -229,16 +280,6 @@ class FUGKApp(ctk.CTk):
         self.tray_spacing_units.grid(row=0, column=2, padx=3)
         ctk.CTkLabel(size_frame, text="Default 24 in (610 mm). Affects height only.", font=ctk.CTkFont(size=9), text_color="gray").grid(row=0, column=3, sticky="w")
 
-        # NRTL Binary Parameters (only relevant when NRTL model is selected)
-        self.nrtl_frame = ctk.CTkFrame(left)
-        self.nrtl_frame.pack(fill="x", padx=10, pady=4)
-        ctk.CTkLabel(self.nrtl_frame, text="NRTL Parameters (tau = (gij-gjj)/RT, alpha typically 0.2-0.47)", 
-                     font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=5, pady=2)
-        self.nrtl_params_container = ctk.CTkFrame(self.nrtl_frame)
-        self.nrtl_params_container.pack(fill="x", padx=5, pady=2)
-        ctk.CTkButton(self.nrtl_frame, text="Refresh NRTL Pairs from Chemicals", 
-                      command=self.refresh_nrtl_params_ui, width=200, fg_color="#455A64").pack(pady=3)
-
         # Action buttons + big Calculate
         action_row = ctk.CTkFrame(left)
         action_row.pack(fill="x", padx=10, pady=6)
@@ -246,7 +287,7 @@ class FUGKApp(ctk.CTk):
         ctk.CTkButton(action_row, text="Load Example", command=self.load_example, width=105, fg_color="#455A64").pack(side="left")
         ctk.CTkButton(action_row, text="Re-estimate α at T", command=self.recalculate_alphas, width=140, fg_color="#1565C0").pack(side="left", padx=6)
 
-        ctk.CTkButton(left, text="🚀 Calculate Column (FUGK + Duties + Sizing)",
+        ctk.CTkButton(left, text="🚀 Calculate Column (Fenske-Underwood-Gilliland-Kirkbride + Duties + Sizing)",
                       command=self.calculate,
                       fg_color="#1565C0", height=50, font=ctk.CTkFont(size=15, weight="bold")).pack(pady=8, padx=10, fill="x")
 
@@ -261,9 +302,7 @@ class FUGKApp(ctk.CTk):
         ctk.CTkButton(res_btns, text="💾 Export CSV", command=self.export_csv, width=130, fg_color="#2E7D32").pack(side="left", padx=8)
         ctk.CTkButton(res_btns, text="Clear Output", command=lambda: self.results_box.delete("1.0", "end"), width=110).pack(side="left")
 
-        # Initial state for NRTL frame visibility
-        if hasattr(self, "on_thermo_method_changed"):
-            self.on_thermo_method_changed(self.thermo_method.get())
+
 
     # ==================== CHEMICAL MANAGEMENT ====================
     def search_chemical(self):
@@ -272,16 +311,31 @@ class FUGKApp(ctk.CTk):
             return
         results = search_chemicals(q)
         if results:
-            names = [r["name"] for r in results]
-            self.search_results.configure(values=names)
-            self.last_search_results = results   # keep full info (incl. mw) for adding
-            if names:
-                self.search_results.set(names[0])
+            # Rich display so user knows exactly what identifier / name will be used for the chemical
+            # Format: "Preferred Name (Formula) [CAS: xxxxx]"
+            display_values = []
+            self._search_map = {}  # display -> clean name (used for add + property lookup)
+            for r in results:
+                name = r.get("name", q)
+                formula = r.get("formula", "?")
+                cas = r.get("cas")
+                cas_part = f" [CAS: {cas}]" if cas else ""
+                display = f"{name} ({formula}){cas_part}"
+                display_values.append(display)
+                self._search_map[display] = name
+
+            self.search_results.configure(values=display_values)
+            self.last_search_results = results   # keep full info (incl. mw, cas, etc.) for adding
+            if display_values:
+                self.search_results.set(display_values[0])
         else:
             messagebox.showinfo("No Results", f"No chemicals found for '{q}'")
 
     def add_chemical(self):
-        name = self.search_results.get()
+        selected = self.search_results.get()
+        # Use the clean name from our map (strips the formula/CAS suffix we added for display)
+        name = self._search_map.get(selected, selected) if hasattr(self, "_search_map") else selected
+
         if not name or "Search results" in name:
             messagebox.showwarning("Select Chemical", "Please search and select a chemical.")
             return
@@ -305,22 +359,19 @@ class FUGKApp(ctk.CTk):
 
         z = 1.0 / (len(self.chemicals) + 1) if self.chemicals else 0.5
 
-        # Capture MW from the most recent search + rich thermo props for different models
+        # Capture MW from the most recent search
         mw = 100.0
         for r in getattr(self, "last_search_results", []):
             if r.get("name") == name:
                 mw = r.get("mw") or r.get("MW") or 100.0
                 break
 
-        rich = get_rich_thermo_properties(name)
-        chem_entry = {
+        self.chemicals.append({
             "name": name,
             "z": round(z, 4),
             "alpha": round(alpha, 4),
             "mw": float(mw) if mw else 100.0
-        }
-        chem_entry.update(rich)  # adds tc, pc_bar, omega, etc. when available
-        self.chemicals.append(chem_entry)
+        })
 
         # If this is the first chemical, make it both for now (user will pick keys)
         if len(self.chemicals) == 1:
@@ -328,8 +379,6 @@ class FUGKApp(ctk.CTk):
             self.hk_name = name
 
         self.refresh_table()
-        if hasattr(self, "refresh_nrtl_params_ui"):
-            self.refresh_nrtl_params_ui()
 
     def recalculate_alphas(self):
         """Recalculate α for all chemicals. Reference = selected HK (or lowest alpha)."""
@@ -417,16 +466,12 @@ class FUGKApp(ctk.CTk):
         name = self.tree.item(selected[0], "values")[0]
         self.chemicals = [c for c in self.chemicals if c["name"] != name]
         self.refresh_table()
-        if hasattr(self, "refresh_nrtl_params_ui"):
-            self.refresh_nrtl_params_ui()
 
     def clear_all(self):
         self.chemicals = []
         self.lk_name = ""
         self.hk_name = ""
         self.refresh_table()
-        if hasattr(self, "refresh_nrtl_params_ui"):
-            self.refresh_nrtl_params_ui()
         self.results_box.delete("1.0", "end")
 
     # --- LK / HK management ---
@@ -522,8 +567,6 @@ class FUGKApp(ctk.CTk):
         self.r_ratio.delete(0, "end"); self.r_ratio.insert(0, str(ex["r_ratio"]))
 
         self.refresh_table()
-        if hasattr(self, "refresh_nrtl_params_ui"):
-            self.refresh_nrtl_params_ui()
         messagebox.showinfo("Example Loaded", f"Loaded preset: {choice}\nAdjust specs or α as needed then Calculate.")
 
     # --- New feed temperature → q and normalize features ---
@@ -627,131 +670,7 @@ class FUGKApp(ctk.CTk):
         self.refresh_table()
 
     # --- NRTL support ---
-    def on_thermo_method_changed(self, choice=None):
-        if hasattr(self, "nrtl_frame"):
-            if choice and "nrtl" in choice.lower():
-                self.nrtl_frame.pack(fill="x", padx=10, pady=4)
-                if hasattr(self, "refresh_nrtl_params_ui"):
-                    self.refresh_nrtl_params_ui()
-            else:
-                self.nrtl_frame.pack_forget()
 
-    def refresh_nrtl_params_ui(self):
-        """Rebuild the NRTL parameter input rows based on current chemicals."""
-        if not hasattr(self, "nrtl_params_container"):
-            return
-
-        # Clear old widgets
-        for widget in self.nrtl_params_container.winfo_children():
-            widget.destroy()
-        self.nrtl_entry_widgets = {}
-
-        if len(self.chemicals) < 2:
-            ctk.CTkLabel(self.nrtl_params_container, text="(Add at least 2 chemicals for NRTL pairs)").pack()
-            return
-
-        names = [c["name"] for c in self.chemicals]
-        row = 0
-        for i in range(len(names)):
-            for j in range(i+1, len(names)):
-                n1, n2 = names[i], names[j]
-                pair = (n1, n2)
-
-                row_frame = ctk.CTkFrame(self.nrtl_params_container)
-                row_frame.pack(fill="x", pady=1)
-
-                ctk.CTkLabel(row_frame, text=f"{n1} ↔ {n2} :").pack(side="left", padx=3)
-
-                ctk.CTkLabel(row_frame, text="tau12").pack(side="left")
-                e12 = ctk.CTkEntry(row_frame, width=55)
-                e12.pack(side="left", padx=1)
-
-                ctk.CTkLabel(row_frame, text="tau21").pack(side="left")
-                e21 = ctk.CTkEntry(row_frame, width=55)
-                e21.pack(side="left", padx=1)
-
-                ctk.CTkLabel(row_frame, text="alpha").pack(side="left")
-                e_alpha = ctk.CTkEntry(row_frame, width=45)
-                e_alpha.insert(0, "0.3")
-                e_alpha.pack(side="left", padx=1)
-
-                # Set sensible defaults for NRTL (not zero!) 
-                # Pre-populate a few common systems with approximate literature-ish values.
-                common_defaults = {
-                    ("Benzene", "Toluene"): (0.32, 0.18, 0.30),
-                    ("Toluene", "Benzene"): (0.18, 0.32, 0.30),
-                    ("Propylene", "Propane"): (0.15, 0.12, 0.30),
-                    ("Propane", "Propylene"): (0.12, 0.15, 0.30),
-                }
-
-                if pair in getattr(self, "nrtl_params", {}):
-                    t12, t21, a = self.nrtl_params[pair]
-                    e12.insert(0, str(round(t12, 3)))
-                    e21.insert(0, str(round(t21, 3)))
-                    e_alpha.delete(0, "end")
-                    e_alpha.insert(0, str(round(a, 3)))
-                elif pair in common_defaults:
-                    t12, t21, a = common_defaults[pair]
-                    e12.insert(0, str(t12))
-                    e21.insert(0, str(t21))
-                    e_alpha.delete(0, "end")
-                    e_alpha.insert(0, str(a))
-                else:
-                    # Dynamic initial guess for any searched chemical pair.
-                    # Uses the current alpha (relative volatility) and mw difference as a rough heuristic
-                    # for starting tau values (larger volatility or size difference → larger non-ideality).
-                    # alpha is left at the default 0.3.
-                    try:
-                        import math
-                        a1 = next((c["alpha"] for c in self.chemicals if c["name"] == n1), 1.5)
-                        a2 = next((c["alpha"] for c in self.chemicals if c["name"] == n2), 1.0)
-                        mw1 = next((c.get("mw", 100) for c in self.chemicals if c["name"] == n1), 100)
-                        mw2 = next((c.get("mw", 100) for c in self.chemicals if c["name"] == n2), 100)
-
-                        delta_log_a = abs(math.log(max(a1, 1e-6) / max(a2, 1e-6)))
-                        delta_mw = abs(mw1 - mw2) / max(max(mw1, mw2), 50)
-                        base_tau = min(0.85, 0.12 + 0.55 * delta_log_a + 0.18 * delta_mw)
-                        tau12 = round(base_tau, 3)
-                        tau21 = round(base_tau * 0.75, 3)  # mild asymmetry common
-                    except:
-                        tau12 = 0.25
-                        tau21 = 0.25
-
-                    e12.insert(0, str(tau12))
-                    e21.insert(0, str(tau21))
-                    # alpha already set to 0.3 above
-
-                    # Seed self.nrtl_params immediately so collect works even before user edits
-                    self.nrtl_params[pair] = (tau12, tau21, 0.3)
-                    self.nrtl_params[(n2, n1)] = (tau21, tau12, 0.3)
-
-                self.nrtl_entry_widgets[pair] = {"tau12": e12, "tau21": e21, "alpha": e_alpha}
-                row += 1
-
-    def _collect_nrtl_params(self):
-        """Collect current NRTL parameters from the UI entries. Robust to missing/empty widgets."""
-        params = {}
-        widgets_dict = getattr(self, "nrtl_entry_widgets", {})
-        if not widgets_dict:
-            return params
-        for pair, widgets in widgets_dict.items():
-            try:
-                e12 = widgets.get("tau12")
-                e21 = widgets.get("tau21")
-                e_a = widgets.get("alpha")
-                t12 = float(e12.get()) if e12 else 0.25
-                t21 = float(e21.get()) if e21 else 0.25
-                a = float(e_a.get()) if e_a else 0.3
-                params[pair] = (t12, t21, a)
-                # Store reverse direction too
-                n1, n2 = pair
-                params[(n2, n1)] = (t21, t12, a)
-            except (ValueError, AttributeError, KeyError):
-                # Fallback to small non-zero values so NRTL doesn't collapse to ideal
-                n1, n2 = pair
-                params[pair] = (0.25, 0.25, 0.3)
-                params[(n2, n1)] = (0.25, 0.25, 0.3)
-        return params
 
     # ==================== CALCULATION (full new workflow) ====================
     def calculate(self):
@@ -801,32 +720,12 @@ class FUGKApp(ctk.CTk):
             # Build alpha dict from current table
             alpha = {c["name"]: c["alpha"] for c in self.chemicals}
 
-            # === Thermodynamic method from dropdown ===
-            thermo_method = self.thermo_method.get() if hasattr(self, "thermo_method") else "Ideal (Raoult's law)"
 
-            # Build props dict for the chosen method (Tc, Pc in bar, omega, etc.)
-            props = {}
-            for c in self.chemicals:
-                nm = c["name"]
-                p = {}
-                if c.get("tc"): p["tc"] = c["tc"]
-                if c.get("pc_bar"): p["pc_bar"] = c["pc_bar"]
-                if c.get("omega") is not None: p["omega"] = c["omega"]
-                if c.get("tb"): p["tb"] = c["tb"]
-                if c.get("mw"): p["mw"] = c["mw"]
-                props[nm] = p
 
-            # NRTL params if applicable
-            nrtl_params = {}
-            if "nrtl" in thermo_method.lower():
-                nrtl_params = self._collect_nrtl_params()
+            # === DERIVE q internally using ideal model ===
+            q, feed_state, q_info = compute_feed_quality(components, z_mole, T_feed, P_bar)
 
-            # === DERIVE q internally using selected thermo method ===
-            q, feed_state, q_info = compute_feed_quality(
-                components, z_mole, T_feed, P_bar, method=thermo_method, props=props, nrtl_params=nrtl_params
-            )
-
-            # === RUN FUGK on consistent molar basis ===
+            # === RUN Fenske-Underwood-Gilliland-Kirkbride on consistent molar basis ===
             calc = FUGKDistillation(
                 components=components,
                 z_feed=z_mole,
@@ -852,19 +751,16 @@ class FUGKApp(ctk.CTk):
             D_mass = sum(results.component_splits[c][0] * mw_dict.get(c, 100) for c in components)
             B_mass = sum(results.component_splits[c][1] * mw_dict.get(c, 100) for c in components)
 
-            # === THERMODYNAMIC TEMPERATURES (top/bottom) ===
-            # Use Ideal (Raoult's + real Psat) for product saturation temperatures.
-            # This keeps T_top / T_bot physically reasonable even when non-ideal model is chosen for the feed flash.
-            # The selected non-ideal method primarily affects the feed q calculation.
+            # === THERMODYNAMIC TEMPERATURES (top/bottom) using ideal model ===
             xd = results.distillate_composition
             xb = results.bottoms_composition
             T_top = estimate_dew_point(
                 components, [xd.get(c, 0) for c in components], P_bar,
-                T_guess=T_feed - 10, method="Ideal (Raoult's law)", props=props
+                T_guess=T_feed - 10
             )
             T_bot = estimate_bubble_point(
                 components, [xb.get(c, 0) for c in components], P_bar,
-                T_guess=T_feed + 30, method="Ideal (Raoult's law)", props=props
+                T_guess=T_feed + 30
             )
 
             # === DUTIES (very approximate shortcut energy balance) ===
@@ -930,7 +826,6 @@ class FUGKApp(ctk.CTk):
                     "total_molar_feed_kmolh": total_molar_flow,
                     "feed_temp_K": T_feed,
                     "pressure_bar": P_bar,
-                    "thermo_method": thermo_method,
                     "derived_q": q,
                     "feed_state": feed_state,
                     "lk": lk, "hk": hk,
@@ -953,17 +848,20 @@ class FUGKApp(ctk.CTk):
             # === BUILD RICH OUTPUT ===
             self.results_box.delete("1.0", "end")
             lines = []
-            lines.append("=== FUGK SHORTCUT DISTILLATION RESULTS (full workflow) ===\n")
+            lines.append("=== Fenske-Underwood-Gilliland-Kirkbride (FUGK) SHORTCUT DISTILLATION RESULTS (full workflow) ===\n")
+            lines.append("⚠️ DISCLAIMER: This tool uses ONLY Raoult's Law (ideal VLE assumption: K_i = P_sat,i(T) / P) for all thermodynamic calculations (feed q, K-values, bubble/dew points, etc.).")
+            lines.append("   Results are approximate and should be treated with caution for any real mixture that exhibits non-idealities (azeotropes, activity coefficients ≠ 1, etc.).")
+            lines.append("   Always validate with rigorous simulation for final design.\n")
             lines.append(f"LK: {lk}  |  HK: {hk}")
-            lines.append(f"Thermodynamic Model: {thermo_method}")
             lines.append(f"Feed: {total_molar_flow:.2f} kmol/h   |   T_feed = {T_feed:.1f} K   |   P = {P_bar:.2f} bar")
             lines.append(f"Derived feed condition: q = {q:.3f}   ({feed_state})")
             lines.append(f"Recoveries: LK→D {lk_rec_d*100:.1f}%   |   HK→B {hk_rec_b*100:.1f}%   |   R/Rmin = {r_ratio:.2f}\n")
 
-            lines.append("--- FUGK Results ---")
+            lines.append("--- Fenske-Underwood-Gilliland-Kirkbride (FUGK) Results ---")
             lines.append(f"N_min = {results.N_min}     R_min = {results.R_min}")
             lines.append(f"Actual stages = {results.N_actual}     Operating R = {results.R_actual}")
-            lines.append(f"Optimal feed stage (from top) = {results.feed_stage}\n")
+            lines.append(f"Optimal feed stage at minimum stages (Fenske / total reflux): {results.feed_stage_min}")
+            lines.append(f"Optimal feed stage at actual operating stages (Gilliland): {results.feed_stage_actual}\n")
 
             lines.append("--- Distillate & Bottoms ---")
             lines.append(f"Distillate: {D_molar:.2f} kmol/h   ({D_mass:.1f} kg/h)")
@@ -991,7 +889,10 @@ class FUGKApp(ctk.CTk):
             lines.append("Tray numbering and height basis (important assumptions):")
             lines.append("- Tray #1 = the top tray in the column. The condenser (even a total condenser) is not counted as a tray.")
             lines.append("- The reboiler is treated as the final equilibrium stage. Therefore N_actual includes the reboiler as one of the contact stages.")
-            lines.append("- Optimal feed stage (Kirkbride) is numbered starting from Tray #1 at the top of the column.")
+            lines.append("- Feed stages (Kirkbride correlation):")
+            lines.append("  - feed_stage_min: recommended feed location if the column ran at total reflux (using N_min from Fenske).")
+            lines.append("  - feed_stage_actual: recommended feed location for the actual operating column (using N_actual from Gilliland).")
+            lines.append("  Both are numbered starting from Tray #1 at the top.")
             lines.append("- Column height calculation = (N_actual) × tray spacing + extra allowance (currently ~3 × tray spacing).")
             lines.append("  The allowance accounts for: top vapor disengagement space, bottom liquid sump / reboiler, condenser, and support.")
             lines.append("- Diameter is a rough estimate based on vapor loading in the rectifying section (highest vapor flow) at ~80% of flooding.")
@@ -1015,7 +916,7 @@ class FUGKApp(ctk.CTk):
             for c in components:
                 lines.append(f"  {c:<14} xD={results.distillate_composition[c]:.4f}   xB={results.bottoms_composition[c]:.4f}")
 
-            lines.append("\n(Assumptions: constant α, ideal VLE for flash & T estimates, total condenser, CMO for duties, simple flooding for diameter. Validate with rigorous simulator for final design.)")
+            lines.append("\n(Assumptions: constant α, Raoult's Law / ideal VLE only for all thermo calculations, total condenser, CMO for duties, simple flooding for diameter. This tool is for preliminary/educational use only — validate with rigorous simulator for final design.)")
 
             self.results_box.insert("1.0", "\n".join(lines))
 
@@ -1060,7 +961,7 @@ class FUGKApp(ctk.CTk):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["FUGK Distillation Results Export"])
+                w.writerow(["Fenske-Underwood-Gilliland-Kirkbride (FUGK) Distillation Results Export"])
                 w.writerow([])
                 w.writerow(["Inputs"])
                 w.writerow(["Feed flow (kmol/h)", inp.get("feed_flow")])
@@ -1076,7 +977,8 @@ class FUGKApp(ctk.CTk):
                 w.writerow(["R_min", res.R_min])
                 w.writerow(["N_actual", res.N_actual])
                 w.writerow(["R_actual", res.R_actual])
-                w.writerow(["Feed stage (top)", res.feed_stage])
+                w.writerow(["Feed stage (min stages, total reflux)", res.feed_stage_min])
+                w.writerow(["Feed stage (actual operating stages)", res.feed_stage_actual])
                 w.writerow([])
                 w.writerow(["Component", "z_feed", "alpha", "D_flow_kmolh", "B_flow_kmolh", "rec_to_D", "xD", "xB"])
                 for c in inp["components"]:
